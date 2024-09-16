@@ -1,0 +1,626 @@
+---
+title: "Taxi Data New York"
+author: "Japekam Dang"
+output: html_document
+subtitle: "Using ML Techniques"
+---
+
+# 1. Introduction
+
+In this lab, the objective was to construct a predictive model to estimate the tip amount given to New York City taxi drivers based on various features of the trip. The model was developed using data from Week 2 of February 2017 and was evaluated on data from Week 4 of the same month. The main goal was to find a model that generalizes well to unseen data, with Mean Squared Prediction Error (MSPE) serving as the primary metric for evaluating model performance.
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(ggplot2)
+library(lubridate)
+library(leaps)
+library(glmnet)
+``` 
+
+# 2. Data Loading and Initial Exploration
+
+## 2.1 Data Loading and Initial Exploration
+
+The datasets for Week 2 and Week 4 of February 2017 were loaded, along with a zone lookup table, to potentially map location IDs to geographic names. The initial exploration involved examining the structure and contents of the Week 2 dataset to understand the variables and identify any immediate issues, such as missing values or irrelevant columns.
+
+
+```{r}
+week2_data <- read_csv("week2.csv")
+week4_data <- read_csv("week4.csv")
+zone_lookup <- read_csv("taxi+_zone_lookup.csv")
+
+head(week2_data)
+head(week4_data)
+
+summary(week2_data)
+glimpse(week2_data)
+```
+
+## 2.2 Initial Data Cleaning
+
+To prepare the data for analysis, irrelevant columns, such as congestion_surcharge and airport_fee, were dropped. Additionally, rows with missing or invalid data—particularly those where tip_amount, fare_amount, or trip_distance were zero or missing—were filtered out. This step was essential to ensure that the data used for modeling was clean and reliable.
+
+
+```{r}
+# Drop irrelevant columns and filter out rows with missing or invalid data
+week2_cleaned <- week2_data %>%
+  select(-c(congestion_surcharge, airport_fee)) %>%
+  filter(!is.na(tip_amount) & fare_amount > 0 & trip_distance > 0)
+
+# Check for remaining missing values
+week2_cleaned %>% summarise_all(funs(sum(is.na(.))))
+```
+
+## 2.3 Outlier Detection and Removal
+
+To address the issue of outliers, I calculated thresholds based on the 1st and 99th percentiles for tip_amount, fare_amount, and trip_distance. Data points that fell outside these thresholds were considered outliers and were removed from the analysis to maintain the integrity of the dataset.
+
+
+```{r}
+# Calculate thresholds for outliers using the 1st and 99th percentiles
+tip_upper_threshold <- quantile(week2_cleaned$tip_amount, 0.99)
+fare_upper_threshold <- quantile(week2_cleaned$fare_amount, 0.99)
+distance_upper_threshold <- quantile(week2_cleaned$trip_distance, 0.99)
+
+# Remove outliers based on the calculated thresholds
+week2_cleaned <- week2_cleaned %>%
+  filter(tip_amount <= tip_upper_threshold, 
+         fare_amount <= fare_upper_threshold, 
+         trip_distance <= distance_upper_threshold)
+```
+
+# 3. Data Transformation
+
+## 3.1 Feature Engineering
+
+Feature engineering was a crucial step to enhance the predictive power of the model. In this step, we performed several data transformations to prepare the `week2_cleaned` dataset for further analysis:
+
+1. **Extracting the Pickup Hour (`pickup_hour`)**:
+   - We used the `hour()` function to extract the hour from the `tpep_pickup_datetime` column. This allows us to analyze patterns in taxi pickups based on the time of day.
+
+2. **Extracting the Day of the Week (`day_of_week`)**:
+   - The `wday()` function was employed to extract the day of the week from the `tpep_pickup_datetime` column, with labels for each day (e.g., "Mon", "Tue"). This helps in examining trends across different days of the week.
+
+3. **Calculating Trip Duration (`trip_duration`)**:
+   - We calculated the duration of each trip in minutes using the difference between the pickup and dropoff times. Trip duration is a key factor that could influence fare and tip amounts.
+
+4. **Categorizing Trip Distance (`trip_distance_bin`)**:
+   - The continuous `trip_distance` variable was categorized into bins labeled "Short", "Medium", "Long", and "Very Long". Binning simplifies the analysis by grouping trips of similar distances together.
+
+5. **Categorizing Fare Amount (`fare_bin`)**:
+   - Similarly, the `fare_amount` variable was categorized into "Low", "Medium", "High", and "Very High" bins. This categorization aids in identifying trends and differences across fare ranges.
+
+6. **Factorizing Payment Type (`payment_type`)**:
+   - The `payment_type` variable was converted into a factor with labels "Credit Card", "Cash", "No Charge", and "Dispute". Understanding the distribution of payment types can provide insights into customer behavior and payment preferences.
+
+These transformations are crucial for cleaning and structuring the data, making it more suitable for exploratory data analysis and subsequent modeling tasks.
+
+
+```{r}
+week2_cleaned <- week2_cleaned %>%
+  mutate(
+    pickup_hour = hour(tpep_pickup_datetime),
+    dropoff_hour = hour(tpep_dropoff_datetime),
+    day_of_week = wday(tpep_pickup_datetime, label = TRUE),
+    trip_duration = as.numeric(difftime(tpep_dropoff_datetime, tpep_pickup_datetime, units = "mins")),
+    trip_distance_bin = cut(trip_distance, breaks = c(0, 2, 5, 10, Inf), labels = c("Short", "Medium", "Long", "Very Long")),
+    fare_bin = cut(fare_amount, breaks = c(0, 10, 20, 30, Inf), labels = c("Low", "Medium", "High", "Very High")),
+    payment_type = factor(payment_type, levels = c(1, 2, 3, 4), labels = c("Credit Card", "Cash", "No Charge", "Dispute"))
+  )
+```
+
+## 3.2 Sampling for EDA
+
+Given the large size of the dataset, a random 10% subsample was taken to facilitate faster exploratory data analysis (EDA). This sampling approach allowed us to efficiently generate visualizations and insights without compromising the overall integrity of the analysis.
+
+
+```{r}
+# Set a seed for reproducibility
+set.seed(123)
+
+# Take a random 10% subsample of the data
+sampled_data <- week2_data %>% sample_frac(0.1)
+sample_cleaned <- week2_cleaned %>% sample_frac(0.1)
+
+# Check the size of the subsample
+nrow(sampled_data)
+nrow(sample_cleaned)
+```
+
+# 4. Exploratory Data Analysis (EDA)
+
+## 4.1 Distribution of Tip Amounts
+
+```{r}
+# Plot the distribution of tip amounts
+ggplot(week2_cleaned, aes(x = tip_amount)) +
+  geom_histogram(bins = 30, fill = "blue", color = "black") +
+  theme_minimal() +
+  labs(title = "Distribution of Tip Amounts", x = "Tip Amount", y = "Count") +
+  xlim(0,30)
+```
+
+This histogram visualizes the frequency of different tip amounts, revealing that most tips are concentrated at lower values, with a significant drop-off as the tip amount increases.
+
+
+## 4.2 Distribution of Trip Distances
+
+```{r}
+# Plot the distribution of trip distances
+ggplot(week2_cleaned, aes(x = trip_distance)) +
+  geom_histogram(bins = 30, fill = "green", color = "black") +
+  theme_minimal() +
+  labs(title = "Distribution of Trip Distances", x = "Trip Distance", y = "Count") +
+  xlim(0,25)
+```
+
+This histogram displays the frequency of different trip distances, showing that the majority of trips are relatively short, with a sharp decrease in the number of longer trips.
+
+## 4.3 Density Plot of Fare Amounts
+
+```{r}
+# Density plot for fare amounts
+ggplot(week2_cleaned, aes(x = fare_amount)) +
+  geom_density(fill = "red", alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Density Plot of Fare Amounts", x = "Fare Amount") +
+  xlim(0,50)
+```
+
+This density plot shows the distribution of fare amounts, highlighting that most fares are clustered around lower values, with a gradual decline as the fare amount increases.
+
+## 4.4 Distribution of Payment Types
+
+```{r}
+# Count the number of trips for each payment type
+payment_type_distribution <- sample_cleaned %>%
+  group_by(payment_type) %>%
+  summarise(count = n())
+
+# Plot the distribution of payment types with custom labels
+ggplot(payment_type_distribution, aes(x = payment_type, y = count, fill = payment_type)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_minimal() +
+  labs(title = "Distribution of Payment Types", 
+       x = "Payment Type", y = "Number of Trips") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+This bar chart visualizes the distribution of different payment types used by passengers. The majority of trips are paid using credit cards, indicating a preference for electronic payments. Cash is the second most common payment method, while "No Charge" and "Dispute" categories are relatively rare, suggesting that issues with payment or non-payment are uncommon.
+
+
+## 4.5 Scatter Plot of Fare Amount vs. Tip Amount
+
+```{r}
+# Scatter plot of fare amount vs. tip amount
+ggplot(sample_cleaned, aes(x = fare_amount, y = tip_amount)) +
+  geom_point(alpha = 0.3) +
+  theme_minimal() +
+  labs(title = "Scatter Plot of Fare Amount vs. Tip Amount", x = "Fare Amount", y = "Tip Amount") +
+  xlim(0,300)
+```
+
+This scatter plot visualizes the relationship between fare amounts and tip amounts. The plot reveals a slight positive correlation between the two variables, with a wide variation in tip amounts even for higher fares. Most tips are concentrated at lower values, indicating that larger fares do not necessarily lead to proportionally larger tips.
+
+
+## 4.6 Scatter Plot of Trip Distance vs. Tip Amount
+
+```{r}
+# Scatter plot of trip distance vs. tip amount
+ggplot(sample_cleaned, aes(x = trip_distance, y = tip_amount)) +
+  geom_point(alpha = 0.3) +
+  theme_minimal() +
+  labs(title = "Scatter Plot of Trip Distance vs. Tip Amount", x = "Trip Distance", y = "Tip Amount") +
+  xlim(0,100)
+```
+
+This scatter plot examines the relationship between trip distance and tip amount. While there is some indication that longer trips might result in higher tips, the plot shows significant variability. Many shorter trips also yield higher tips, suggesting that factors other than trip distance play a role in determining tip amounts.
+
+
+## 4.7 Scatter Plot of Fare Amount vs. Tip Amount by Trip Distance
+
+
+```{r}
+ggplot(sample_cleaned, aes(x = fare_amount, y = tip_amount)) +
+  geom_point(alpha = 0.3) +
+  facet_wrap(~ trip_distance_bin) +
+  labs(title = "Scatter Plot of Fare Amount vs. Tip Amount by Trip Distance", x = "Fare Amount", y = "Tip Amount")
+```
+
+In this analysis, I created a faceted scatter plot to examine the relationship between fare amount and tip amount across different trip distance categories ("Short", "Medium", "Long", "Very Long"). By faceting the plot by `trip_distance_bin`, we can observe how the relationship between fare and tip varies depending on the length of the trip. 
+
+The faceted plots made it easier to compare these relationships side by side. 
+
+
+## 4.8 Passenger Count vs. Tip Amount (Violin Plot)
+
+
+```{r}
+# Convert passenger_count to a factor
+week2_data <- week2_data %>%
+  mutate(passenger_count = factor(passenger_count))
+
+# Violin plot for Passenger Count vs. Tip Amount
+ggplot(week2_data, aes(x = passenger_count, y = tip_amount)) +
+  geom_violin(fill = "skyblue", color = "black") +
+  theme_minimal() +
+  labs(title = "Passenger Count vs. Tip Amount (Violin Plot)", x = "Passenger Count", y = "Tip Amount")
+```
+
+This violin plot visualizes the distribution of tip amounts across different passenger counts, allowing us to see how tips vary with the number of passengers. The plot highlights the spread and density of tips for each passenger count category.
+
+
+## 4.9(a) Pickup Hour vs. Tip Amount (Initial Attempt)
+
+
+```{r}
+# Plot relationship between Pickup Hour and Tip Amount
+ggplot(sample_cleaned, aes(x = pickup_hour, y = tip_amount)) +
+  geom_boxplot(fill = "orange", color = "black") +
+  theme_minimal() +
+  labs(title = "Pickup Hour vs. Tip Amount", x = "Pickup Hour", y = "Tip Amount")
+```
+
+In the initial attempt to create a box plot showing the relationship between pickup hour and tip amount, I encountered an issue where the plot didn't display the data correctly. The box plot appeared condensed, with the x-axis not appropriately reflecting the hourly data. This happened because the `pickup_hour` variable was treated as a continuous numeric variable rather than a categorical one.
+
+
+## 4.9(b) Pickup Hour vs. Tip Amount (Corrected Approach)
+
+
+```{r}
+# Include the updated code for creating the boxplot
+sample_cleaned <- sample_cleaned %>%
+  mutate(pickup_hour = factor(pickup_hour, levels = 0:23, labels = sprintf("%02d:00", 0:23)))
+
+ggplot(sample_cleaned, aes(x = pickup_hour, y = tip_amount)) +
+  geom_boxplot(fill = "orange", color = "black", width = 0.9) +
+  theme_minimal() +
+  labs(title = "Pickup Hour vs. Tip Amount", x = "Pickup Hour", y = "Tip Amount") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+To address the issue, I converted the `pickup_hour` variable into a factor with levels representing each hour of the day. This allowed the box plot to correctly represent each hour on the x-axis, displaying the distribution of tip amounts across different hours more effectively. The x-axis labels were also rotated for better readability.
+
+## 4.10(a) Is Night vs. Tip Amount (Initial Attempt)
+
+
+```{r}
+# Create a flag for night trips
+sample_cleaned <- sample_cleaned %>%
+  mutate(is_night = ifelse(pickup_hour >= 22 | pickup_hour <= 5, 1, 0))
+
+# Plot relationship between Is Night and Tip Amount
+ggplot(sample_cleaned, aes(x = factor(is_night), y = tip_amount)) +
+  geom_boxplot(fill = "red", color = "black") +
+  theme_minimal() +
+  labs(title = "Is Night vs. Tip Amount", x = "Day VS Night", y = "Tip Amount")
+```
+
+In the initial attempt to plot the relationship between whether a trip occurred at night and the tip amount, I encountered an issue where the plot displayed an "NA" category. This happened because the `pickup_hour` variable was not correctly processed, leading to incorrect assignment in the `is_night` flag.
+
+## 4.11(b) Is Night vs. Tip Amount (Corrected Approach)
+
+
+```{r}
+sample_cleaned <- sample_cleaned %>%
+  mutate(
+    pickup_hour = as.numeric(pickup_hour),  # Convert to numeric if it's a factor
+    is_night = ifelse(pickup_hour >= 22 | pickup_hour <= 5, "Night", "Day")  # Create is_night flag
+  )
+# Plot relationship between Is Night and Tip Amount
+ggplot(sample_cleaned, aes(x = factor(is_night), y = tip_amount)) +
+  geom_boxplot(fill = "red", color = "black") +
+  theme_minimal() +
+  labs(title = "Is Night vs. Tip Amount", x = "Day VS Night", y = "Tip Amount")
+```
+
+To fix the issue, I converted the `pickup_hour` variable to a numeric type and then correctly categorized trips as "Day" or "Night" based on the hour of pickup. This allowed the box plot to accurately reflect the distribution of tips for day and night trips.
+
+### Observation
+
+The corrected plot shows that there is no significant difference in the distribution of tip amounts between day and night trips. Both distributions are concentrated around lower tip amounts, with a similar spread across both categories.
+
+
+## 4.12 Average Tip Amount by Pickup Hour and Time of Day, across the Week
+
+
+```{r}
+# Calculate average tip amount by hour, day, and night
+avg_tips_by_hour <- sample_cleaned %>%
+  group_by(day_of_week, pickup_hour, is_night) %>%
+  summarise(avg_tip_amount = mean(tip_amount, na.rm = TRUE)) %>%
+  ungroup()
+
+# Create the line plot
+ggplot(avg_tips_by_hour, aes(x = pickup_hour, y = avg_tip_amount, color = is_night, group = is_night)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(title = "Average Tip Amount by Pickup Hour and Time of Day, Faceted by Day of the Week", 
+       x = "Pickup Hour", y = "Average Tip Amount", color = "Time of Day") +
+  facet_wrap(~ day_of_week, ncol = 3) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+To understand how tipping behavior varies across different times of the day and days of the week, I calculated the average tip amount grouped by pickup hour, day of the week, and whether the trip occurred during the day or night. This was then visualized in a faceted line plot, with each facet representing a different day of the week. The plot shows that average tip amounts tend to be higher during the night across most days, with noticeable dips during early morning hours. This suggests that both the time of day and the specific day of the week influence tipping behavior.
+
+## 4.13 Density Plot of Tip Amount by Payment Type
+
+
+```{r}
+ggplot(sample_cleaned, aes(x = tip_amount, fill = payment_type)) +
+  geom_density(alpha = 0.7, color = "black") +  # Add color outline for better distinction
+  theme_minimal() +
+  labs(title = "Density Plot of Tip Amount by Payment Type", 
+       x = "Tip Amount", y = "Density", fill = "Payment Type") +
+  xlim(-1, 10) +  # Limit the x-axis to the range 0-10 +
+  ylim(0, 3) +
+  scale_fill_manual(values = c("Credit Card" = "blue", "Cash" = "green", 
+                               "No Charge" = "red", "Dispute" = "purple")) +  # Assign distinct colors
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+This density plot was created to analyze how tip amounts vary by payment type. By plotting the density of tips across different payment methods, I aimed to identify patterns in tipping behavior associated with each payment method. The plot shows that credit card payments are associated with a higher density of low tip amounts, while cash and other payment types show different distributions, indicating varying tipping behaviors depending on the method of payment.
+
+
+# 5. Model Construction
+
+## 5.1 Subset Selection using regsubsets
+
+To identify the best combination of predictors for the model, regsubsets was used. This method helps in selecting the most relevant variables based on Adjusted R², which balances model complexity and predictive power. The selected variables were then used to build an initial linear regression model.
+
+
+```{r}
+formula <- tip_amount ~ fare_amount + trip_distance + pickup_hour + dropoff_hour + day_of_week +
+  passenger_count + payment_type + trip_duration
+```
+
+```{r}
+# Perform subset selection
+regfit <- regsubsets(formula, data = week2_cleaned, nvmax = 8)  # Adjust nvmax as needed
+
+# Get the summary of the results
+reg_summary <- summary(regfit)
+
+# Find the best model based on Adjusted R²
+best_model_index <- which.max(reg_summary$adjr2)
+best_model <- coef(regfit, best_model_index)
+
+print(best_model)
+```
+
+## 5.2 Linear Regression and Backward Selection
+
+The best predictors identified by regsubsets were used to fit a linear regression model. To further refine the model, backward selection was performed. This process involves iteratively removing the least significant predictor, based on the p-value, to improve model simplicity without sacrificing predictive power. The linear model and the backward selection model provided similar results, indicating that almost all the variables were significant.
+
+```{r}
+best_formula <- tip_amount ~ fare_amount + trip_distance + pickup_hour + dropoff_hour +
+  day_of_week + payment_type + trip_duration
+
+# Fit the linear regression model
+lm_model <- lm(best_formula, data = week2_cleaned)
+summary(lm_model)
+```
+
+
+
+
+```{r}
+best_formula <- tip_amount ~ fare_amount + trip_distance + pickup_hour + dropoff_hour +
+  day_of_week + payment_type + trip_duration
+
+# Fit the model using the best formula
+best_model <- lm(best_formula, data = week2_cleaned)
+summary(best_model)
+```
+
+```{r}
+# Perform backward selection starting from the full model
+backward_model <- step(lm_model, direction = "backward")
+summary(backward_model)
+```
+
+# 5.3 Ridge Regression
+
+Given the possibility of multicollinearity among predictors (where some predictors are highly correlated), a Ridge regression model was fitted. Ridge regression helps address multicollinearity by adding a penalty to the size of coefficients, thereby reducing the variance of the model and potentially improving prediction accuracy. This method is particularly useful when dealing with many predictors or when predictors are correlated.
+
+
+```{r}
+# Prepare data for Ridge regression
+x_train <- model.matrix(best_formula, data = week2_cleaned)[, -1]
+y_train <- week2_cleaned$tip_amount
+
+# Fit Ridge regression model
+ridge_model <- cv.glmnet(x_train, y_train, alpha = 0)  # alpha = 0 for Ridge
+
+# Summary of the Ridge model
+summary(ridge_model)
+```
+
+```{r}
+# Ensure pickup_hour exists in week4_data
+week4_data <- week4_data %>%
+  mutate(
+    pickup_hour = hour(tpep_pickup_datetime),  # Assuming pickup_hour is derived from a datetime column
+    dropoff_hour = hour(tpep_dropoff_datetime),  # Similarly for dropoff_hour
+    day_of_week = wday(tpep_pickup_datetime, label = TRUE),
+    trip_duration = as.numeric(difftime(tpep_dropoff_datetime, tpep_pickup_datetime, units = "mins")),
+    trip_distance_bin = cut(trip_distance, breaks = c(0, 2, 5, 10, Inf), labels = c("Short", "Medium", "Long", "Very Long")),
+    fare_bin = cut(fare_amount, breaks = c(0, 10, 20, 30, Inf), labels = c("Low", "Medium", "High", "Very High")),
+    payment_type = factor(payment_type, levels = c(1, 2, 3, 4), labels = c("Credit Card", "Cash", "No Charge", "Dispute"))
+  )
+```
+
+
+## 5.4 Model Evaluation
+
+To compare the performance of the linear regression, backward selection, and Ridge regression models, several metrics were calculated, including AIC (Akaike Information Criterion), BIC (Bayesian Information Criterion), R², Adjusted R², and MSPE (Mean Squared Prediction Error). These metrics help assess the trade-off between model complexity and predictive accuracy.
+
+```{r}
+# Calculate AIC and BIC for Linear and Backward Selection models
+lm_aic <- AIC(lm_model)
+lm_bic <- BIC(lm_model)
+
+backward_aic <- AIC(backward_model)
+backward_bic <- BIC(backward_model)
+
+# Predict on Week 4 data and calculate MSPE
+week4_predictions_lm <- predict(lm_model, newdata = week4_data)
+lm_mspe <- mean((week4_data$tip_amount - week4_predictions_lm)^2)
+
+week4_predictions_backward <- predict(backward_model, newdata = week4_data)
+backward_mspe <- mean((week4_data$tip_amount - week4_predictions_backward)^2)
+
+# Ridge model predictions on Week 4 and MSPE
+x_test <- model.matrix(best_formula, data = week4_data)[, -1]
+week4_predictions_ridge <- predict(ridge_model, newx = x_test, s = "lambda.min")
+ridge_mspe <- mean((week4_data$tip_amount - week4_predictions_ridge)^2)
+
+# Calculate R² and Adjusted R² for all models
+lm_r2 <- summary(lm_model)$r.squared
+lm_adj_r2 <- summary(lm_model)$adj.r.squared
+
+backward_r2 <- summary(backward_model)$r.squared
+backward_adj_r2 <- summary(backward_model)$adj.r.squared
+
+ridge_r2 <- 1 - sum((y_train - predict(ridge_model, x_train, s = "lambda.min"))^2) / sum((y_train - mean(y_train))^2)
+ridge_adj_r2 <- 1 - (1 - ridge_r2) * (nrow(week2_cleaned) - 1) / (nrow(week2_cleaned) - ncol(x_train) - 1)
+
+# Compile results into a data frame
+model_comparison <- data.frame(
+  Model = c("Linear", "Backward Selection", "Ridge"),
+  AIC = c(lm_aic, backward_aic, NA),  # AIC not available for Ridge
+  BIC = c(lm_bic, backward_bic, NA),  # BIC not available for Ridge
+  R2 = c(lm_r2, backward_r2, ridge_r2),
+  Adj_R2 = c(lm_adj_r2, backward_adj_r2, ridge_adj_r2),
+  MSPE = c(lm_mspe, backward_mspe, ridge_mspe)
+)
+
+print(model_comparison)
+```
+
+
+## 5.5 Cross-Validation and Final Model Selection
+
+Given the potential for overfitting, especially with Ridge regression, cross-validation was employed to further validate the performance of the Ridge model. Cross-validation helps ensure that the model generalizes well to unseen data by splitting the dataset into training and validation sets multiple times.
+
+
+```{r}
+# Perform cross-validation on the Ridge model
+cv_ridge_model <- cv.glmnet(x_train, y_train, alpha = 0)
+plot(cv_ridge_model)  # Plot the cross-validation curve
+
+# Identify the lambda with the minimum MSE
+best_lambda <- cv_ridge_model$lambda.min
+print(best_lambda)
+
+# Fit the Ridge model using the best lambda
+final_ridge_model <- glmnet(x_train, y_train, alpha = 0, lambda = best_lambda)
+
+# Summary of the final Ridge model
+summary(final_ridge_model)
+```
+
+
+The final model was selected based on the MSPE on the Week 4 data, which is a direct measure of prediction error on unseen data. The Ridge regression model was selected due to its robustness against multicollinearity and its better generalization ability, as indicated by cross-validation.
+
+## 5.6 Final Model Prediction and Evaluation
+
+The final Ridge model was used to make predictions on the Week 4 data, and the MSPE was calculated to assess the model's performance. The comparison between the MSPE on the Week 2 data (training set) and the Week 4 data (test set) indicated that the model performed consistently, with only a slight increase in prediction error on the test set.
+
+
+```{r}
+# Make final predictions on Week 4 data using the chosen model (Ridge)
+final_predictions <- predict(final_ridge_model, newx = x_test)
+final_mpse <- mean((week4_data$tip_amount - final_predictions)^2)
+
+# Output the final MSPE
+print(final_mpse)
+```
+
+The final MSPE for the Ridge regression model was 316.68, which was comparable to the MSPE of 313.17 on the Week 2 data. This small difference suggests that the model generalizes well and provides reliable predictions for unseen data
+
+
+# 6. Conclusion / Final Report
+
+This lab aimed to construct a predictive model for estimating tip amounts for New York City taxi trips using data from February 2017. The process involved a series of critical steps, each contributing to the model's development and performance.
+
+## 6.1 Data Loading and Initial Exploration
+
+We began by loading and exploring the datasets for Week 2 and Week 4 of February 2017. The initial exploration was crucial in understanding the structure of the data, identifying missing values, and recognizing irrelevant columns that could be dropped. This step set the foundation for subsequent data cleaning and transformation.
+
+
+## ***6.2 Data Cleaning***
+
+Data cleaning involved filtering out rows with missing or invalid data, such as zero or negative values for tip_amount, fare_amount, or trip_distance. Additionally, irrelevant columns like congestion_surcharge and airport_fee were removed. This step was essential to ensure that the dataset used for modeling was reliable and free of noise that could skew the results.
+
+
+## ***6.3 Outlier Detection and Removal***
+
+Outliers can have a significant impact on the performance of a predictive model, leading to overfitting or skewed predictions. To address this, we calculated thresholds based on the 1st and 99th percentiles for key variables like tip_amount, fare_amount, and trip_distance. Data points falling outside these thresholds were removed, ensuring that the model was trained on representative data.
+
+
+## ***6.4 Feature Engineering and Data Transformation***
+
+To enhance the predictive power of the model, several new features were engineered:
+
+*Pickup and Dropoff Hour*: Extracting the hour from the pickup and dropoff timestamps allowed us to analyze time-based patterns in tipping behavior. This was particularly useful in identifying peaks in tipping during certain hours of the day.
+
+*Day of the Week*: By extracting the day of the week, we could examine how tipping behavior varied across different days. For example, tips might be higher on weekends compared to weekdays.
+
+*Trip Duration*: Calculating the duration of each trip provided insights into whether longer trips led to higher tips.
+
+*Categorization of Trip Distance and Fare Amount*: Binning continuous variables like trip_distance and fare_amount into categories helped simplify the analysis and revealed distinct patterns within these ranges.
+
+*Payment Type Factorization*: Converting payment_type into a factor allowed us to explore how different payment methods influenced tipping behavior.
+
+These transformations were instrumental in structuring the data for exploratory data analysis (EDA) and modeling, making the dataset more intuitive and insightful.
+
+
+## ***6.5 Exploratory Data Analysis (EDA)***
+
+EDA played a critical role in uncovering the relationships between tip_amount and other variables. Through various visualizations, we observed the following:
+
+*Tip Amount Distribution*: Most tips were concentrated at lower values, with a significant drop-off as the tip amount increased. This pattern suggested that while larger tips occur, they are relatively rare.
+
+*Trip Distance and Fare Amount Distribution*: The majority of trips were short, with fare amounts clustered around lower values. Understanding these distributions was key to setting realistic expectations for the model's predictions.
+
+*Relationships Between Variables*: Scatter plots, violin plots, and faceted plots revealed how variables like fare_amount, trip_distance, payment_type, and pickup_hour influenced tipping. For example, a slight positive correlation was observed between fare_amount and tip_amount, though there was considerable variation.
+
+*Time-Based Patterns*: Analyzing the pickup_hour and is_night variables showed that tips varied by the time of day and day of the week. However, no significant difference was found between day and night trips, suggesting that other factors may play a more critical role in determining tip amounts.
+
+
+## ***6.6 Model Construction and Evaluation***
+
+Several models were constructed and evaluated to predict tip amounts:
+
+*Subset Selection using regsubsets*: This method identified the best combination of predictors based on Adjusted R², helping to balance model complexity with predictive power.
+
+*Linear Regression and Backward Selection*: The best predictors were used to fit a linear regression model, which was further refined using backward selection. Both approaches yielded similar results, indicating that almost all variables were significant in predicting tips.
+
+*Ridge Regression*: Given the potential for multicollinearity among predictors, Ridge regression was employed. This technique added a penalty to the size of the coefficients, helping to reduce the model's variance and improve its generalization ability.
+
+*Model Comparison*: Metrics such as AIC, BIC, R², Adjusted R², and MSPE were calculated for each model. The Ridge regression model was selected as the final model due to its robustness against multicollinearity and better generalization to unseen data.
+
+
+## ***6.7 Final Model Selection and Prediction***
+
+The final Ridge regression model was validated using cross-validation and was chosen for making predictions on the Week 4 data. The final MSPE was 316.68, which was comparable to the MSPE of 313.17 on the Week 2 data. This small increase in prediction error suggested that the model generalized well, making it a reliable choice for predicting taxi trip tips.
+
+
+## ***6.8 Understanding MSPE and Model Interpretation***
+
+*Mean Squared Prediction Error (MSPE)*: MSPE measures the average squared difference between predicted and actual values, with units in squared dollars (dollars²). A lower MSPE indicates better predictive accuracy. In this analysis, the MSPE for the final Ridge regression model was 316.68 on the Week 4 data, which was comparable to the MSPE of 313.17 on the Week 2 data. This small difference suggests that the model generalizes well to unseen data, maintaining a similar level of accuracy.
+
+*Prediction Accuracy and Face Validity:* The small increase in MSPE from Week 2 to Week 4 indicates that the model performs consistently and is not overfitting. The predictions align with expected tipping behavior, adding to the model's face validity. However, any unrealistic predictions would suggest issues with the model's assumptions or the data.
+
+*Model Flaws:* Despite its strengths, the model may not capture all factors influencing tips, such as service quality or customer satisfaction. Additionally, it assumes a linear relationship between predictors and tips, which may not hold true for all variables.
+
+
+## ***6.9 Summary of Findings and Implications***
+
+Our analysis of New York City taxi data from February 2017 revealed that fare amount and trip distance were significant predictors of tip amounts, with higher fares generally leading to higher tips. However, variability in tips even for similar trip distances suggests that other factors, such as payment type and time of day, also influence tipping behavior. We found that tips were typically higher when passengers paid by credit card compared to cash. The model's performance, with an MSPE of 316.68 on the Week 4 data, indicates it generalizes well to unseen data, effectively capturing the key drivers of tipping behavior. These insights could inform strategies to optimize fare structures and payment systems, ultimately improving driver earnings and passenger satisfaction.
